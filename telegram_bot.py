@@ -242,13 +242,16 @@ def find_font_size(text, max_width, max_height, font_path):
         # Try to wrap the text
         lines = wrap_text(text, font, max_width)
 
-        # Calculate total height using uniform line height
+        # Calculate total height using uniform line height with safety margins
         total_height = uniform_line_height * len(lines)
 
-        # Add some spacing between lines (20% of font size)
+        # Add spacing between lines (20% of font size) and safety margin
         if len(lines) > 1:
             spacing = int(fontsize * 0.2)
             total_height += spacing * (len(lines) - 1)
+
+        # Add 10% safety margin for display variations
+        total_height = int(total_height * 1.1)
 
         # Check if it fits
         if total_height > max_height:
@@ -290,7 +293,7 @@ def generate_wrapped_colored_text(text, font, max_width):
     result_lines = []
     global_char_pos = 0
 
-    for line in wrapped_lines:
+    for line_index, line in enumerate(wrapped_lines):
         line_parts = []
         line_start_pos = global_char_pos
         line_end_pos = global_char_pos + len(line)
@@ -323,8 +326,10 @@ def generate_wrapped_colored_text(text, font, max_width):
         if line_parts:
             result_lines.append(line_parts)
 
-        # Update global position (+1 for space between words, except for last line)
-        global_char_pos += len(line) + 1
+        # Update global position (only add 1 for space if this is not the last line)
+        global_char_pos += len(line)
+        if line_index < len(wrapped_lines) - 1:  # Add space between lines
+            global_char_pos += 1
 
     return result_lines
 
@@ -384,17 +389,20 @@ def generate_text_image(text, font_size=30):
 
             line_widths.append(line_width)
 
-        # Calculate total height with line spacing
+        # Calculate total height with line spacing and safety margin
         line_spacing = int(font_size * 0.2)  # 20% of font size
         total_height = uniform_line_height * len(wrapped_lines)
         if len(wrapped_lines) > 1:
             total_height += line_spacing * (len(wrapped_lines) - 1)
 
+        # Add small safety margin to prevent text from going off-screen
+        total_height = int(total_height * 1.05)
+
         # Find the maximum line width for centering
         max_line_width = max(line_widths) if line_widths else 0
 
-        # Center the text block
-        start_y = (display.height - total_height) // 2
+        # Center the text block with margin to ensure it fits on screen
+        start_y = max(10, (display.height - total_height) // 2)
 
         # Draw each line with uniform height
         current_y = start_y
@@ -402,31 +410,34 @@ def generate_text_image(text, font_size=30):
             # Center this line horizontally
             start_x = (display.width - line_width) // 2
 
+            logger.debug(f"DEBUG LINE {i}: start_y={current_y}, line_width={line_width}, start_x={start_x}, uniform_line_height={uniform_line_height}")
+
             # Draw each part in the line
             current_x = start_x
-            for part_text, color in line_parts:
+            for j, (part_text, color) in enumerate(line_parts):
                 if color == 'RED':
                     text_color = (255, 0, 0)
                 else:
                     text_color = (0, 0, 0)
 
-                # Calculate vertical position for this part (centered within uniform line height)
+                # Calculate text dimensions for debugging
                 try:
-                    part_bbox = font.getbbox(part_text)
-                    part_height = part_bbox[3] - part_bbox[1]
-                    part_y = current_y + (uniform_line_height - part_height) // 2
+                    bbox = font.getbbox(part_text)
+                    part_width = bbox[2] - bbox[0]
+                    part_height = bbox[3] - bbox[1]
                 except:
-                    # Fallback for older PIL versions - just center it in the line
-                    part_y = current_y
+                    # Fallback for older PIL versions
+                    part_width, part_height = draw.textsize(part_text, font=font)
+
+                # Simple approach: position all parts at the same Y coordinate for the line
+                # This ensures proper alignment across different character heights
+                part_y = current_y
+
+                logger.debug(f"  PART {j}: '{part_text}' color={color} x={current_x}, y={part_y}, width={part_width}, height={part_height}")
 
                 draw.text((current_x, part_y), part_text, font=font, fill=text_color)
 
                 # Move to next part position
-                try:
-                    bbox = font.getbbox(part_text)
-                    part_width = bbox[2] - bbox[0]
-                except:
-                    part_width, _ = draw.textsize(part_text, font=font)
                 current_x += part_width
 
             # Move to next line using uniform height
