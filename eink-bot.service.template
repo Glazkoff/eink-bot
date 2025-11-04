@@ -1,0 +1,17 @@
+[Unit]
+Description=E-ink Telegram Bot Service
+After=network.target
+
+[Service]
+User=root
+Group=root
+
+WorkingDirectory=/home/orangepi
+
+ExecStart=/home/orangepi/venv/bin/python /home/orangepi/develop/eink_bot/telegram_bot.py
+
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
