@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 import os
-import asyncio
-import logging
 from io import BytesIO
 from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -30,6 +28,11 @@ BUSY_PIN = board.PH4
 
 # --- Display configuration ---
 DISPLAY = {"WIDTH": 800, "HEIGHT": 480, "rotation": 0}
+
+# --- Font configuration ---
+FONT = "/home/orangepi/develop/eink_bot/fonts/Inter.ttf"
+EMOJI_FONT = "/home/orangepi/develop/eink_bot/fonts/NotoEmoji.ttf"
+MAX_FONT_SIZE = 300
 
 # Global display object
 display = None
@@ -165,6 +168,34 @@ def parse_colored_text(text):
 
     return parts if parts else [(text, 'BLACK')]
 
+def wrap_text_mixed(text, font_size, max_width):
+    """Wrap text using mixed font measurement to fit within max_width, preserving word boundaries."""
+    words = text.split(' ')
+    lines = []
+    current_line = ""
+    for i, word in enumerate(words):
+        # Test if adding this word would exceed the line width
+        test_line = current_line + (' ' if current_line else '') + word
+        test_width, _ = get_mixed_text_size(test_line, font_size)
+
+        if test_width <= max_width:
+            current_line = test_line
+        else:
+            # If current line is not empty, add it to lines and start new line
+            if current_line:
+                lines.append(current_line)
+                current_line = word
+            else:
+                # Single word is too long, add it anyway (will be truncated)
+                lines.append(word)
+                current_line = ""
+
+    # Add the last line if it's not empty
+    if current_line:
+        lines.append(current_line)
+
+    return lines
+
 def wrap_text(text, font, max_width):
     """Wrap text to fit within max_width using word boundaries."""
     import textwrap
@@ -223,24 +254,16 @@ def wrap_text(text, font, max_width):
     return lines
 
 def find_font_size(text, max_width, max_height, font_path):
-    """Find optimal font size for text, considering text wrapping."""
+    """Find optimal font size for text, considering text wrapping with mixed fonts."""
     fontsize = 10
     best_size = 10
 
     while True:
-        font = ImageFont.truetype(font_path, fontsize)
+        # Calculate uniform line height using mixed fonts
+        _, uniform_line_height = get_mixed_text_size("Ay", fontsize)
 
-        # Calculate uniform line height
-        try:
-            sample_bbox = font.getbbox("Ay")
-            uniform_line_height = sample_bbox[3] - sample_bbox[1]
-        except:
-            # Fallback for older PIL versions
-            font_size_calc = fontsize * 1.2  # Approximate height
-            uniform_line_height = int(font_size_calc)
-
-        # Try to wrap the text
-        lines = wrap_text(text, font, max_width)
+        # Try to wrap the text using mixed font measurement
+        lines = wrap_text_mixed(text, fontsize, max_width)
 
         # Calculate total height using uniform line height with safety margins
         total_height = uniform_line_height * len(lines)
@@ -261,13 +284,14 @@ def find_font_size(text, max_width, max_height, font_path):
         fontsize += 1
 
         # Prevent infinite loop
-        if fontsize > 300:
+        if fontsize > MAX_FONT_SIZE:
             break
 
     return best_size
 
 def generate_wrapped_colored_text(text, font, max_width):
     """Generate wrapped text lines with color information preserved."""
+
     # First, parse the colored text parts
     text_parts = parse_colored_text(text)
 
@@ -286,8 +310,9 @@ def generate_wrapped_colored_text(text, font, max_width):
         })
         current_pos += len(part_text)
 
-    # Wrap the clean text using words
-    wrapped_lines = wrap_text(clean_text, font, max_width)
+    # Wrap the clean text using mixed font text measurement
+    font_size = font.size
+    wrapped_lines = wrap_text_mixed(clean_text, font_size, max_width)
 
     # Map colors back to wrapped lines
     result_lines = []
@@ -333,6 +358,187 @@ def generate_wrapped_colored_text(text, font, max_width):
 
     return result_lines
 
+def is_emoji(char):
+    """Check if a character is an emoji."""
+    # Unicode ranges for emojis
+    emoji_ranges = [
+        (0x1F600, 0x1F64F),  # Emoticons
+        (0x1F300, 0x1F5FF),  # Misc Symbols and Pictographs
+        (0x1F680, 0x1F6FF),  # Transport and Map
+        (0x1F1E0, 0x1F1FF),  # Flags (iOS)
+        (0x2600, 0x26FF),    # Misc symbols
+        (0x2700, 0x27BF),    # Dingbats
+        (0xFE00, 0xFE0F),    # Variation Selectors
+        (0x1F900, 0x1F9FF),  # Supplemental Symbols and Pictographs
+        (0x1F018, 0x1F270),  # Various asian characters
+        (0x238C, 0x2454),    # Misc items
+    ]
+
+    try:
+        code = ord(char)
+        for start, end in emoji_ranges:
+            if start <= code <= end:
+                return True
+    except (TypeError, ValueError):
+        # Handle multi-byte characters or invalid characters
+        # Check if it's likely an emoji by checking if it contains emoji-like Unicode
+        if len(char) > 1:
+            # Multi-byte character, check if it's in emoji ranges
+            for c in char:
+                try:
+                    code = ord(c)
+                    for start, end in emoji_ranges:
+                        if start <= code <= end:
+                            return True
+                except (TypeError, ValueError):
+                    continue
+    return False
+
+def split_text_by_font(text):
+    """Split text into segments that can be rendered with different fonts."""
+    segments = []
+    current_segment = ""
+    current_is_emoji = False
+
+    for i, char in enumerate(text):
+        char_is_emoji = is_emoji(char)
+        char_code = ord(char) if len(char) == 1 else f"multi-byte: {[ord(c) for c in char]}"
+        # If we need to switch fonts
+        if current_segment and char_is_emoji != current_is_emoji:
+            segment_type = "EMOJI" if current_is_emoji else "TEXT"
+            segments.append((current_segment, current_is_emoji))
+            current_segment = char
+            current_is_emoji = char_is_emoji
+        else:
+            current_segment += char
+            current_is_emoji = char_is_emoji
+    # Add the last segment
+    if current_segment:
+        segment_type = "EMOJI" if current_is_emoji else "TEXT"
+        segments.append((current_segment, current_is_emoji))
+    return segments
+
+def get_mixed_text_size(text, font_size):
+    """Calculate text size using mixed fonts (Inter for text, Noto Color Emoji for emojis)."""
+    try:
+        # Load both fonts
+        text_font = ImageFont.truetype(FONT, font_size)
+        emoji_font = ImageFont.truetype(EMOJI_FONT, font_size)
+    except Exception as e:
+        logger.warning(f"  Size calculation font error: {e}")
+        # Fallback to Inter font only
+        try:
+            font = ImageFont.truetype(FONT, font_size)
+        except:
+            font = ImageFont.load_default()
+        try:
+            bbox = font.getbbox(text)
+            return bbox[2] - bbox[0], bbox[3] - bbox[1]
+        except:
+            try:
+                width, height = font.getsize(text)
+                return width, height
+            except:
+                return len(text) * (font_size // 2), font_size
+
+    # Calculate size using mixed fonts
+    segments = split_text_by_font(text)
+
+    total_width = 0
+    max_height = 0
+
+    for segment_text, is_emoji in segments:
+        if is_emoji:
+            font = emoji_font
+        else:
+            font = text_font
+
+        try:
+            bbox = font.getbbox(segment_text)
+            segment_width = bbox[2] - bbox[0]
+            segment_height = bbox[3] - bbox[1]
+        except:
+            # Fallback method
+            try:
+                segment_width, segment_height = font.getsize(segment_text)
+            except:
+                # Final fallback - estimate
+                segment_width = len(segment_text) * (font_size // 2)
+                segment_height = font_size
+
+        # Handle potential zero-height issues
+        if segment_height == 0:
+            segment_height = font_size
+
+        total_width += segment_width
+        max_height = max(max_height, segment_height)
+
+    # If height is still 0, use font_size as minimum
+    if max_height == 0:
+        max_height = font_size
+    return total_width, max_height
+
+def draw_mixed_text(draw, position, text, font_size, color=(0, 0, 0)):
+    """Draw text using mixed fonts: Inter for text, Noto Color Emoji for emojis."""
+
+    try:
+        # Load both fonts
+        text_font = ImageFont.truetype(FONT, font_size)
+        emoji_font = ImageFont.truetype(EMOJI_FONT, font_size)
+        logger.debug(f"  Fonts loaded successfully: Inter and Noto Color Emoji at size {font_size}")
+    except Exception as e:
+        logger.warning(f"Font loading error: {e}")
+        # Fallback to Inter font only
+        try:
+            text_font = ImageFont.truetype(FONT, font_size)
+        except:
+            text_font = ImageFont.load_default()
+        emoji_font = text_font  # Use same font as fallback
+
+    # Analyze text for emoji content
+    segments = split_text_by_font(text)
+
+    # Draw each segment with appropriate font
+    x, y = position
+    for i, (segment_text, is_emoji) in enumerate(segments):
+        segment_type = "EMOJI" if is_emoji else "TEXT"
+
+        if is_emoji:
+            font = emoji_font
+        else:
+            font = text_font
+
+        try:
+            draw.text((x, y), segment_text, font=font, fill=color)
+        except Exception as e:
+            # Try with the other font as fallback
+            try:
+                fallback_font = text_font if is_emoji else emoji_font
+                draw.text((x, y), segment_text, font=fallback_font, fill=color)
+            except Exception as e2:
+                # Draw placeholder
+                try:
+                    draw.text((x, y), "[?]", font=text_font, fill=color)
+                except:
+                    logger.error(f"    Could not even draw placeholder")
+
+        # Calculate segment width for positioning
+        try:
+            bbox = font.getbbox(segment_text)
+            segment_width = bbox[2] - bbox[0]
+        except:
+            # Fallback method
+            try:
+                segment_width = draw.textlength(segment_text, font=font)
+            except:
+                # Final fallback - estimate based on character count
+                segment_width = len(segment_text) * (font_size // 2)
+
+        x += segment_width
+
+    final_x = x
+    return final_x
+
 def generate_text_image(text, font_size=30):
     """Generate a PIL image with centered text on white background with text wrapping."""
     if display is None:
@@ -340,13 +546,13 @@ def generate_text_image(text, font_size=30):
         return None
 
     try:
-        # Create a black and white image
+        # Create a white background image for e-ink display
         image = Image.new("RGB", (display.width, display.height), (255, 255, 255))
         draw = ImageDraw.Draw(image)
 
         # Try to load a font, fallback to default if not available
         try:
-            font = ImageFont.truetype("/home/orangepi/develop/eink_bot/fonts/Inter.ttf", font_size)
+            font = ImageFont.truetype(FONT, font_size)
         except:
             try:
                 logger.warning(f'ERROR TO LOAD INTER FONT WITH SIZE {font_size}!')
@@ -378,13 +584,8 @@ def generate_text_image(text, font_size=30):
             line_width = 0
 
             for part_text, color in line_parts:
-                try:
-                    bbox = font.getbbox(part_text)
-                    part_width = bbox[2] - bbox[0]
-                except:
-                    # Fallback for older PIL versions
-                    part_width, _ = draw.textsize(part_text, font=font)
-
+                # Calculate text width using mixed fonts
+                part_width, _ = get_mixed_text_size(part_text, font_size)
                 line_width += part_width
 
             line_widths.append(line_width)
@@ -412,7 +613,7 @@ def generate_text_image(text, font_size=30):
 
             logger.debug(f"DEBUG LINE {i}: start_y={current_y}, line_width={line_width}, start_x={start_x}, uniform_line_height={uniform_line_height}")
 
-            # Draw each part in the line
+            # Draw each part in the line using mixed fonts
             current_x = start_x
             for j, (part_text, color) in enumerate(line_parts):
                 if color == 'RED':
@@ -420,14 +621,8 @@ def generate_text_image(text, font_size=30):
                 else:
                     text_color = (0, 0, 0)
 
-                # Calculate text dimensions for debugging
-                try:
-                    bbox = font.getbbox(part_text)
-                    part_width = bbox[2] - bbox[0]
-                    part_height = bbox[3] - bbox[1]
-                except:
-                    # Fallback for older PIL versions
-                    part_width, part_height = draw.textsize(part_text, font=font)
+                # Calculate text dimensions using mixed fonts
+                part_width, part_height = get_mixed_text_size(part_text, font_size)
 
                 # Simple approach: position all parts at the same Y coordinate for the line
                 # This ensures proper alignment across different character heights
@@ -435,7 +630,8 @@ def generate_text_image(text, font_size=30):
 
                 logger.debug(f"  PART {j}: '{part_text}' color={color} x={current_x}, y={part_y}, width={part_width}, height={part_height}")
 
-                draw.text((current_x, part_y), part_text, font=font, fill=text_color)
+                # Draw text using mixed fonts (Inter + Noto Color Emoji)
+                draw_mixed_text(draw, (current_x, part_y), part_text, font_size, text_color)
 
                 # Move to next part position
                 current_x += part_width
@@ -553,10 +749,9 @@ async def text_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # Auto-calculate font size if not provided
     if auto_sized or font_size is None:
         try:
-            font_path = "/home/orangepi/develop/eink_bot/fonts/Inter.ttf"
             # Remove RED{...} tags for accurate text measurement
             clean_text = text_message.replace("RED{", "").replace("}", "")
-            font_size = find_font_size(clean_text, display.width - 40, display.height - 40, font_path)
+            font_size = find_font_size(clean_text, display.width - 40, display.height - 40, FONT)
             auto_sized = True
             logger.info(f"Auto-calculated font size: {font_size} for text: '{text_message}'")
         except Exception as e:
