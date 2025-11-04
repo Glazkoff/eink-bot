@@ -32,7 +32,7 @@ DISPLAY = {"WIDTH": 800, "HEIGHT": 480, "rotation": 0}
 # --- Font configuration ---
 FONT = "/home/orangepi/develop/eink_bot/fonts/Inter.ttf"
 EMOJI_FONT = "/home/orangepi/develop/eink_bot/fonts/NotoEmoji.ttf"
-MAX_FONT_SIZE = 300
+MAX_FONT_SIZE = 350
 
 # Global display object
 display = None
@@ -265,6 +265,12 @@ def find_font_size(text, max_width, max_height, font_path):
         # Try to wrap the text using mixed font measurement
         lines = wrap_text_mixed(text, fontsize, max_width)
 
+        # Check if any wrapped lines exceed the maximum width
+        max_line_width = 0
+        for line in lines:
+            line_width, _ = get_mixed_text_size(line, fontsize)
+            max_line_width = max(max_line_width, line_width)
+
         # Calculate total height using uniform line height with safety margins
         total_height = uniform_line_height * len(lines)
 
@@ -276,8 +282,8 @@ def find_font_size(text, max_width, max_height, font_path):
         # Add 10% safety margin for display variations
         total_height = int(total_height * 1.1)
 
-        # Check if it fits
-        if total_height > max_height:
+        # Check if it fits both width and height constraints
+        if total_height > max_height or max_line_width > max_width:
             return best_size  # Return previous successful size
 
         best_size = fontsize
@@ -751,6 +757,7 @@ async def text_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         try:
             # Remove RED{...} tags for accurate text measurement
             clean_text = text_message.replace("RED{", "").replace("}", "")
+            logger.debug(f'RECEIVED TEXT: "{clean_text}"')
             font_size = find_font_size(clean_text, display.width - 40, display.height - 40, FONT)
             auto_sized = True
             logger.info(f"Auto-calculated font size: {font_size} for text: '{text_message}'")
