@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import os
+import asyncio
+from datetime import datetime, timedelta
 from io import BytesIO
 from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -39,6 +41,10 @@ display = None
 
 # Global debug mode flag
 debug_mode = True
+
+# Global clock state
+clock_active = False
+clock_task = None
 
 def init_display():
     """Initialize the e-ink display"""
@@ -680,6 +686,98 @@ def display_text(text, font_size=30):
         logger.error(f"Failed to display text: {e}")
         return False
 
+def generate_clock_image():
+    """Generate a PIL image with current time display."""
+    if display is None:
+        logger.error("Display not initialized")
+        return None
+
+    try:
+        # Get current time
+        now = datetime.now()
+        time_str = now.strftime("%H:%M")
+        date_str = now.strftime("%d.%m.%Y")
+
+        # Create a white background image for e-ink display
+        image = Image.new("RGB", (display.width, display.height), (255, 255, 255))
+        draw = ImageDraw.Draw(image)
+
+        # Calculate font sizes based on display dimensions
+        time_font_size = min(display.width // 4, display.height // 3, 120)
+        date_font_size = time_font_size // 3
+
+        # Try to load fonts, fallback to default if not available
+        try:
+            time_font = ImageFont.truetype(FONT, time_font_size)
+            date_font = ImageFont.truetype(FONT, date_font_size)
+        except:
+            try:
+                time_font = ImageFont.load_default()
+                date_font = ImageFont.load_default()
+            except:
+                logger.error('ERROR TO LOAD DEFAULT FONT!')
+                return None
+
+        # Calculate text dimensions for centering
+        try:
+            time_bbox = time_font.getbbox(time_str)
+            time_width = time_bbox[2] - time_bbox[0]
+            time_height = time_bbox[3] - time_bbox[1]
+
+            date_bbox = date_font.getbbox(date_str)
+            date_width = date_bbox[2] - date_bbox[0]
+            date_height = date_bbox[3] - date_bbox[1]
+        except:
+            # Fallback for older PIL versions
+            time_width, time_height = draw.textsize(time_str, font=time_font)
+            date_width, date_height = draw.textsize(date_str, font=date_font)
+
+        # Calculate positions
+        time_x = (display.width - time_width) // 2
+        time_y = (display.height - time_height - date_height - 20) // 2
+
+        date_x = (display.width - date_width) // 2
+        date_y = time_y + time_height + 60
+
+        # Draw time
+        draw.text((time_x, time_y), time_str, font=time_font, fill=(0, 0, 0))
+
+        # Draw date
+        draw.text((date_x, date_y), date_str, font=date_font, fill=(0, 0, 0))
+
+        return image
+
+    except Exception as e:
+        logger.error(f"Failed to generate clock image: {e}")
+        return None
+
+def display_clock():
+    """Display current time on the e-ink display."""
+    global display
+    if display is None:
+        logger.error("Display not initialized")
+        return False
+
+    try:
+        # Generate the clock image
+        image = generate_clock_image()
+        if image is None:
+            return False
+
+        # Clear the display first to ensure a clean white background
+        display.fill(Adafruit_EPD.WHITE)
+
+        # Display the image
+        display.image(image)
+        display.display()
+
+        logger.info(f"Clock displayed successfully: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        return True
+
+    except Exception as e:
+        logger.error(f"Failed to display clock: {e}")
+        return False
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send a message when the command /start is issued."""
     user = update.effective_user
@@ -696,6 +794,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/help - Show this help message\n"
         "/clear - Clear the display\n"
         "/text <message> [font_size] - Display text on the screen (optional font size, auto if not specified)\n"
+        "/clock - Display a continuously updating clock (updates every minute)\n"
         "/debug - Toggle debug mode (send displayed images back to you)\n\n"
         "Text Features:\n"
         "• Auto text wrapping - Long messages automatically wrap to multiple lines\n"
@@ -703,17 +802,28 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "• Use RED{text} to make text appear in red color\n"
         "• Multiple RED{...} sections supported in wrapped text\n"
         "• Font size range: 1-200 pixels (when specified manually)\n\n"
+        "Clock Features:\n"
+        "• Shows current time in HH:MM:SS format\n"
+        "• Displays current date below the time\n"
+        "• Updates automatically every minute\n"
+        "• Large, easy-to-read font size\n"
+        "• Use /clock again to stop the clock\n\n"
         "Examples:\n"
         "/text Hello World - Auto-size 'Hello World' to fit screen\n"
         "/text This is a very long message that will wrap - Auto-wraps long text\n"
         "/text Hello World 48 - Display 'Hello World' with font size 48\n"
         "/text Hello RED{World} from RED{Bot} - Multi-color text with wrapping\n"
-        "/text RED{Error:} Something went wrong - Auto-wrapped error message"
+        "/text RED{Error:} Something went wrong - Auto-wrapped error message\n"
+        "/clock - Start a continuously updating clock display"
     )
 
 async def clear_display(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Clear the e-ink display."""
     global display
+
+    # Stop clock if it's running
+    stop_clock()
+
     if display is None:
         await update.message.reply_text("Display not initialized.")
         return
@@ -729,6 +839,9 @@ async def clear_display(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def text_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle the /text command to display text on the e-ink screen."""
+    # Stop clock if it's running
+    stop_clock()
+
     # Check if text was provided
     if not context.args:
         await update.message.reply_text("Please provide text to display. Usage: /text <your message> [font_size]")
@@ -805,8 +918,81 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     else:
         await update.message.reply_text("Debug mode OFF - I won't send images back.")
 
+async def clock_update_loop():
+    """Background task that updates the clock display every minute."""
+    global clock_active
+
+    while clock_active:
+        try:
+            # Display current time
+            if display_clock():
+                logger.debug("Clock updated successfully")
+            else:
+                logger.error("Failed to update clock display")
+
+            # Wait until the next minute (sync with minute boundary)
+            now = datetime.now()
+            next_minute = (now + timedelta(minutes=1)).replace(second=0, microsecond=0)
+            sleep_seconds = (next_minute - now).total_seconds()
+
+            logger.debug(f"Clock will update in {sleep_seconds:.1f} seconds")
+            await asyncio.sleep(sleep_seconds)
+
+        except Exception as e:
+            logger.error(f"Error in clock update loop: {e}")
+            # Sleep for 1 minute on error before retrying
+            await asyncio.sleep(60)
+
+async def clock_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle the /clock command to display a continuously updating clock."""
+    global clock_active, clock_task
+
+    try:
+        if clock_active:
+            # Stop the clock
+            clock_active = False
+            if clock_task:
+                clock_task.cancel()
+                clock_task = None
+
+            await update.message.reply_text("Clock stopped! Send another command to display something new.")
+            logger.info("Clock stopped by user command")
+        else:
+            # Start the clock
+            clock_active = True
+
+            # Display clock immediately
+            if display_clock():
+                await update.message.reply_text("Clock started! Displaying current time. The clock will update every minute.\nSend /clock again to stop it.")
+
+                # Start the background update loop
+                clock_task = asyncio.create_task(clock_update_loop())
+                logger.info("Clock started by user command")
+            else:
+                clock_active = False
+                await update.message.reply_text("Failed to start clock display. Please try again.")
+                logger.error("Failed to start clock display")
+
+    except Exception as e:
+        await update.message.reply_text(f"Error with clock command: {e}")
+        logger.error(f"Clock command error: {e}")
+
+def stop_clock():
+    """Stop the clock display if it's active."""
+    global clock_active, clock_task
+
+    if clock_active:
+        clock_active = False
+        if clock_task:
+            clock_task.cancel()
+            clock_task = None
+        logger.info("Clock stopped")
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle photo messages."""
+    # Stop clock if it's running
+    stop_clock()
+
     await update.message.reply_text("Processing photo...")
 
     # Get the largest photo size
@@ -881,6 +1067,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle document messages (images sent as documents)."""
+    # Stop clock if it's running
+    stop_clock()
+
     # Check if document is an image
     if not update.message.document.mime_type.startswith('image/'):
         await update.message.reply_text("Please send an image file.")
@@ -981,6 +1170,7 @@ def main():
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("clear", clear_display))
     application.add_handler(CommandHandler("text", text_command))
+    application.add_handler(CommandHandler("clock", clock_command))
     application.add_handler(CommandHandler("debug", debug_command))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))

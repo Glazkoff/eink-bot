@@ -70,6 +70,13 @@ case "$1" in
         journalctl -u "$SERVICE_NAME" -f
         ;;
 
+    stop)
+        print_status "Stopping service '$SERVICE_NAME'..."
+        check_root
+        systemctl stop "$SERVICE_NAME"
+        print_status "Service stopped."
+        ;;
+
     restart)
         print_status "Restarting service '$SERVICE_NAME'..."
         check_root
@@ -78,11 +85,12 @@ case "$1" in
         ;;
 
     *)
-        echo "Usage: $0 {setup|status|logs|restart}"
+        echo "Usage: $0 {setup|status|logs|stop|restart}"
         echo ""
         echo "  setup   - Copies the template, reloads systemd, and starts/enables the service."
         echo "  status  - Shows the current status of the service."
         echo "  logs    - Shows the live logs of the service."
+        echo "  stop    - Stops the service."
         echo "  restart - Restarts the service."
         exit 1
         ;;

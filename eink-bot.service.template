@@ -8,7 +8,7 @@ Group=root
 
 WorkingDirectory=/home/orangepi
 
-ExecStart=/home/orangepi/venv/bin/python /home/orangepi/develop/eink_bot/telegram_bot.py
+ExecStart=/home/orangepi/venv/bin/python /home/orangepi/develop/eink_bot_clock/telegram_bot.py
 
 Restart=always
 RestartSec=10
