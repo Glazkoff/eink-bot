@@ -1,0 +1,1186 @@
+#!/usr/bin/env python3
+import os
+import asyncio
+from datetime import datetime, timedelta
+from io import BytesIO
+from telegram import Update, Bot
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+import board
+import busio
+import digitalio
+from adafruit_epd.epd import Adafruit_EPD
+from adafruit_epd.uc8179 import Adafruit_UC8179
+from PIL import Image, ImageDraw, ImageFont
+from dotenv import load_dotenv
+from loguru import logger
+
+# Load environment variables
+load_dotenv()
+
+# --- SPI pins (SPI1 hardware bus on Orange Pi Zero 2W) ---
+BOARD_SCK  = board.SPI1_SCLK   # PH6, physical pin 23
+BOARD_MOSI = board.SPI1_MOSI   # PH7, physical pin 19
+BOARD_MISO = board.SPI1_MISO   # PH8, physical pin 21
+BOARD_CS   = board.PC12    # Physical pin 36
+
+# --- Control pins for eInk display ---
+DC_PIN    = board.PI4   # DC, physical pin 38
+RESET_PIN = board.PI16  # RST, physical pin 37
+BUSY_PIN = board.PH4
+
+# --- Display configuration ---
+DISPLAY = {"WIDTH": 800, "HEIGHT": 480, "rotation": 0}
+
+# --- Font configuration ---
+FONT = "/home/orangepi/develop/eink_bot/fonts/Inter.ttf"
+EMOJI_FONT = "/home/orangepi/develop/eink_bot/fonts/NotoEmoji.ttf"
+MAX_FONT_SIZE = 350
+
+# Global display object
+display = None
+
+# Global debug mode flag
+debug_mode = True
+
+# Global clock state
+clock_active = False
+clock_task = None
+
+def init_display():
+    """Initialize the e-ink display"""
+    global display
+    try:
+        # create the spi device and pins we will need
+        spi = busio.SPI(BOARD_SCK, MOSI=BOARD_MOSI, MISO=BOARD_MISO)
+        ecs = digitalio.DigitalInOut(BOARD_CS)
+        dc = digitalio.DigitalInOut(DC_PIN)
+        srcs = None  # can be None to use internal memory
+        rst = digitalio.DigitalInOut(RESET_PIN)  # can be None to not use this pin
+        busy = digitalio.DigitalInOut(BUSY_PIN)  # can be None to not use this pin
+
+        # give them all to our drivers
+        logger.info("Creating display")
+        display = Adafruit_UC8179(
+            DISPLAY['WIDTH'],
+            DISPLAY['HEIGHT'],
+            spi,
+            cs_pin=ecs,
+            dc_pin=dc,
+            sramcs_pin=srcs,
+            rst_pin=rst,
+            busy_pin=busy,
+            tri_color=True
+        )
+
+        display.rotation = 2
+        logger.info("Display initialized successfully")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to initialize display: {e}")
+        return False
+
+def process_and_display_image(image_data):
+    """Process and display image on e-ink display"""
+    global display
+    if display is None:
+        logger.error("Display not initialized")
+        return False
+
+    try:
+        # Open image from bytes
+        image = Image.open(BytesIO(image_data))
+
+        # Convert to RGB if necessary
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+
+        # Scale the image to the smaller screen dimension
+        image_ratio = image.width / image.height
+        screen_ratio = display.width / display.height
+        if screen_ratio < image_ratio:
+            scaled_width = image.width * display.height // image.height
+            scaled_height = display.height
+        else:
+            scaled_width = display.width
+            scaled_height = image.height * display.width // image.width
+        image = image.resize((scaled_width, scaled_height), Image.BICUBIC)
+
+        # Crop and center the image
+        x = scaled_width // 2 - display.width // 2
+        y = scaled_height // 2 - display.height // 2
+        image = image.crop((x, y, x + display.width, y + display.height)).convert("RGB")
+
+        # Create palette for tri-color display
+        palette = []
+        # We'll map the 256 palette indices to our 3 colors
+        # 0-63: Black, 64-127: Red, 128-255: White
+        for i in range(256):
+            if i < 64:
+                palette.extend([0, 0, 0])  # Black
+            elif i < 127:
+                palette.extend([255, 0, 0])  # Red
+            else:
+                palette.extend([255, 255, 255])  # White
+
+        # Create a palette image
+        palette_img = Image.new("P", (1, 1))
+        palette_img.putpalette(palette)
+
+        # Quantize the image using Floyd-Steinberg dithering
+        image = image.quantize(palette=palette_img, dither=Image.FLOYDSTEINBERG)
+
+        # Convert back to RGB for the display driver
+        image = image.convert("RGB")
+
+        # Clear the buffer and display the image
+        display.fill(Adafruit_EPD.WHITE)
+        display.image(image)
+        display.display()
+
+        logger.info("Image displayed successfully")
+        return True
+
+    except Exception as e:
+        logger.error(f"Failed to process image: {e}")
+        return False
+
+def parse_colored_text(text):
+    """Parse text with RED{...} syntax and return list of (text, color) tuples."""
+    import re
+
+    parts = []
+    current_pos = 0
+    pattern = r'RED\{(.*?)\}'
+
+    for match in re.finditer(pattern, text):
+        # Add text before RED{...} in black
+        if match.start() > current_pos:
+            black_text = text[current_pos:match.start()]
+            if black_text:
+                parts.append((black_text, 'BLACK'))
+
+        # Add text inside RED{...} in red
+        red_text = match.group(1)
+        if red_text:
+            parts.append((red_text, 'RED'))
+
+        current_pos = match.end()
+
+    # Add remaining text in black
+    if current_pos < len(text):
+        remaining_text = text[current_pos:]
+        if remaining_text:
+            parts.append((remaining_text, 'BLACK'))
+
+    return parts if parts else [(text, 'BLACK')]
+
+def wrap_text_mixed(text, font_size, max_width):
+    """Wrap text using mixed font measurement to fit within max_width, preserving word boundaries."""
+    words = text.split(' ')
+    lines = []
+    current_line = ""
+    for i, word in enumerate(words):
+        # Test if adding this word would exceed the line width
+        test_line = current_line + (' ' if current_line else '') + word
+        test_width, _ = get_mixed_text_size(test_line, font_size)
+
+        if test_width <= max_width:
+            current_line = test_line
+        else:
+            # If current line is not empty, add it to lines and start new line
+            if current_line:
+                lines.append(current_line)
+                current_line = word
+            else:
+                # Single word is too long, add it anyway (will be truncated)
+                lines.append(word)
+                current_line = ""
+
+    # Add the last line if it's not empty
+    if current_line:
+        lines.append(current_line)
+
+    return lines
+
+def wrap_text(text, font, max_width):
+    """Wrap text to fit within max_width using word boundaries."""
+    import textwrap
+
+    # Use Python's textwrap for better word handling
+    wrapper = textwrap.TextWrapper(width=max_width)
+
+    # But we need to check actual text width since characters have different widths
+    words = text.split()
+    lines = []
+    current_line = []
+
+    for word in words:
+        # Test if adding this word exceeds the width
+        if current_line:
+            test_line = ' '.join(current_line + [word])
+        else:
+            test_line = word
+
+        bbox = font.getbbox(test_line)
+        test_width = bbox[2] - bbox[0]
+
+        if test_width <= max_width:
+            current_line.append(word)
+        else:
+            # If current line has content, add it and start new line
+            if current_line:
+                lines.append(' '.join(current_line))
+                current_line = [word]
+            else:
+                # Single word is too long, try to break it character by character
+                if len(word) > 1:
+                    # Try to find the longest prefix that fits
+                    best_prefix = ""
+                    for i in range(1, len(word) + 1):
+                        test_prefix = word[:i]
+                        bbox = font.getbbox(test_prefix)
+                        if bbox[2] - bbox[0] <= max_width:
+                            best_prefix = test_prefix
+                        else:
+                            break
+
+                    if best_prefix:
+                        lines.append(best_prefix)
+                        current_line = [word[len(best_prefix):]]
+                    else:
+                        lines.append(word[0])  # At least one character
+                        current_line = [word[1:]]
+                else:
+                    lines.append(word)
+
+    # Add the last line
+    if current_line:
+        lines.append(' '.join(current_line))
+
+    return lines
+
+def find_font_size(text, max_width, max_height, font_path):
+    """Find optimal font size for text, considering text wrapping with mixed fonts."""
+    fontsize = 10
+    best_size = 10
+
+    while True:
+        # Calculate uniform line height using mixed fonts
+        _, uniform_line_height = get_mixed_text_size("Ay", fontsize)
+
+        # Try to wrap the text using mixed font measurement
+        lines = wrap_text_mixed(text, fontsize, max_width)
+
+        # Check if any wrapped lines exceed the maximum width
+        max_line_width = 0
+        for line in lines:
+            line_width, _ = get_mixed_text_size(line, fontsize)
+            max_line_width = max(max_line_width, line_width)
+
+        # Calculate total height using uniform line height with safety margins
+        total_height = uniform_line_height * len(lines)
+
+        # Add spacing between lines (20% of font size) and safety margin
+        if len(lines) > 1:
+            spacing = int(fontsize * 0.2)
+            total_height += spacing * (len(lines) - 1)
+
+        # Add 10% safety margin for display variations
+        total_height = int(total_height * 1.1)
+
+        # Check if it fits both width and height constraints
+        if total_height > max_height or max_line_width > max_width:
+            return best_size  # Return previous successful size
+
+        best_size = fontsize
+        fontsize += 1
+
+        # Prevent infinite loop
+        if fontsize > MAX_FONT_SIZE:
+            break
+
+    return best_size
+
+def generate_wrapped_colored_text(text, font, max_width):
+    """Generate wrapped text lines with color information preserved."""
+
+    # First, parse the colored text parts
+    text_parts = parse_colored_text(text)
+
+    # Reconstruct text without color tags for wrapping
+    clean_text = ""
+    part_positions = []
+    current_pos = 0
+
+    for part_text, color in text_parts:
+        clean_text += part_text
+        part_positions.append({
+            'start': current_pos,
+            'end': current_pos + len(part_text),
+            'color': color,
+            'text': part_text
+        })
+        current_pos += len(part_text)
+
+    # Wrap the clean text using mixed font text measurement
+    font_size = font.size
+    wrapped_lines = wrap_text_mixed(clean_text, font_size, max_width)
+
+    # Map colors back to wrapped lines
+    result_lines = []
+    global_char_pos = 0
+
+    for line_index, line in enumerate(wrapped_lines):
+        line_parts = []
+        line_start_pos = global_char_pos
+        line_end_pos = global_char_pos + len(line)
+
+        # Find which parts overlap with this line
+        for part_info in part_positions:
+            part_start = part_info['start']
+            part_end = part_info['end']
+
+            # Check if this part overlaps with the current line
+            if part_end > line_start_pos and part_start < line_end_pos:
+                # Calculate overlap
+                overlap_start = max(part_start, line_start_pos)
+                overlap_end = min(part_end, line_end_pos)
+
+                # Convert to relative positions within the line and part
+                start_in_line = overlap_start - line_start_pos
+                end_in_line = overlap_end - line_start_pos
+                start_in_part = overlap_start - part_start
+                end_in_part = overlap_end - part_start
+
+                # Extract the text segment
+                text_segment = part_info['text'][start_in_part:end_in_part]
+                line_text_segment = line[start_in_line:end_in_line]
+
+                # Use the segment from the original part (should be the same)
+                if text_segment:
+                    line_parts.append((text_segment, part_info['color']))
+
+        if line_parts:
+            result_lines.append(line_parts)
+
+        # Update global position (only add 1 for space if this is not the last line)
+        global_char_pos += len(line)
+        if line_index < len(wrapped_lines) - 1:  # Add space between lines
+            global_char_pos += 1
+
+    return result_lines
+
+def is_emoji(char):
+    """Check if a character is an emoji."""
+    # Unicode ranges for emojis
+    emoji_ranges = [
+        (0x1F600, 0x1F64F),  # Emoticons
+        (0x1F300, 0x1F5FF),  # Misc Symbols and Pictographs
+        (0x1F680, 0x1F6FF),  # Transport and Map
+        (0x1F1E0, 0x1F1FF),  # Flags (iOS)
+        (0x2600, 0x26FF),    # Misc symbols
+        (0x2700, 0x27BF),    # Dingbats
+        (0xFE00, 0xFE0F),    # Variation Selectors
+        (0x1F900, 0x1F9FF),  # Supplemental Symbols and Pictographs
+        (0x1F018, 0x1F270),  # Various asian characters
+        (0x238C, 0x2454),    # Misc items
+    ]
+
+    try:
+        code = ord(char)
+        for start, end in emoji_ranges:
+            if start <= code <= end:
+                return True
+    except (TypeError, ValueError):
+        # Handle multi-byte characters or invalid characters
+        # Check if it's likely an emoji by checking if it contains emoji-like Unicode
+        if len(char) > 1:
+            # Multi-byte character, check if it's in emoji ranges
+            for c in char:
+                try:
+                    code = ord(c)
+                    for start, end in emoji_ranges:
+                        if start <= code <= end:
+                            return True
+                except (TypeError, ValueError):
+                    continue
+    return False
+
+def split_text_by_font(text):
+    """Split text into segments that can be rendered with different fonts."""
+    segments = []
+    current_segment = ""
+    current_is_emoji = False
+
+    for i, char in enumerate(text):
+        char_is_emoji = is_emoji(char)
+        char_code = ord(char) if len(char) == 1 else f"multi-byte: {[ord(c) for c in char]}"
+        # If we need to switch fonts
+        if current_segment and char_is_emoji != current_is_emoji:
+            segment_type = "EMOJI" if current_is_emoji else "TEXT"
+            segments.append((current_segment, current_is_emoji))
+            current_segment = char
+            current_is_emoji = char_is_emoji
+        else:
+            current_segment += char
+            current_is_emoji = char_is_emoji
+    # Add the last segment
+    if current_segment:
+        segment_type = "EMOJI" if current_is_emoji else "TEXT"
+        segments.append((current_segment, current_is_emoji))
+    return segments
+
+def get_mixed_text_size(text, font_size):
+    """Calculate text size using mixed fonts (Inter for text, Noto Color Emoji for emojis)."""
+    try:
+        # Load both fonts
+        text_font = ImageFont.truetype(FONT, font_size)
+        emoji_font = ImageFont.truetype(EMOJI_FONT, font_size)
+    except Exception as e:
+        logger.warning(f"  Size calculation font error: {e}")
+        # Fallback to Inter font only
+        try:
+            font = ImageFont.truetype(FONT, font_size)
+        except:
+            font = ImageFont.load_default()
+        try:
+            bbox = font.getbbox(text)
+            return bbox[2] - bbox[0], bbox[3] - bbox[1]
+        except:
+            try:
+                width, height = font.getsize(text)
+                return width, height
+            except:
+                return len(text) * (font_size // 2), font_size
+
+    # Calculate size using mixed fonts
+    segments = split_text_by_font(text)
+
+    total_width = 0
+    max_height = 0
+
+    for segment_text, is_emoji in segments:
+        if is_emoji:
+            font = emoji_font
+        else:
+            font = text_font
+
+        try:
+            bbox = font.getbbox(segment_text)
+            segment_width = bbox[2] - bbox[0]
+            segment_height = bbox[3] - bbox[1]
+        except:
+            # Fallback method
+            try:
+                segment_width, segment_height = font.getsize(segment_text)
+            except:
+                # Final fallback - estimate
+                segment_width = len(segment_text) * (font_size // 2)
+                segment_height = font_size
+
+        # Handle potential zero-height issues
+        if segment_height == 0:
+            segment_height = font_size
+
+        total_width += segment_width
+        max_height = max(max_height, segment_height)
+
+    # If height is still 0, use font_size as minimum
+    if max_height == 0:
+        max_height = font_size
+    return total_width, max_height
+
+def draw_mixed_text(draw, position, text, font_size, color=(0, 0, 0)):
+    """Draw text using mixed fonts: Inter for text, Noto Color Emoji for emojis."""
+
+    try:
+        # Load both fonts
+        text_font = ImageFont.truetype(FONT, font_size)
+        emoji_font = ImageFont.truetype(EMOJI_FONT, font_size)
+        logger.debug(f"  Fonts loaded successfully: Inter and Noto Color Emoji at size {font_size}")
+    except Exception as e:
+        logger.warning(f"Font loading error: {e}")
+        # Fallback to Inter font only
+        try:
+            text_font = ImageFont.truetype(FONT, font_size)
+        except:
+            text_font = ImageFont.load_default()
+        emoji_font = text_font  # Use same font as fallback
+
+    # Analyze text for emoji content
+    segments = split_text_by_font(text)
+
+    # Draw each segment with appropriate font
+    x, y = position
+    for i, (segment_text, is_emoji) in enumerate(segments):
+        segment_type = "EMOJI" if is_emoji else "TEXT"
+
+        if is_emoji:
+            font = emoji_font
+        else:
+            font = text_font
+
+        try:
+            draw.text((x, y), segment_text, font=font, fill=color)
+        except Exception as e:
+            # Try with the other font as fallback
+            try:
+                fallback_font = text_font if is_emoji else emoji_font
+                draw.text((x, y), segment_text, font=fallback_font, fill=color)
+            except Exception as e2:
+                # Draw placeholder
+                try:
+                    draw.text((x, y), "[?]", font=text_font, fill=color)
+                except:
+                    logger.error(f"    Could not even draw placeholder")
+
+        # Calculate segment width for positioning
+        try:
+            bbox = font.getbbox(segment_text)
+            segment_width = bbox[2] - bbox[0]
+        except:
+            # Fallback method
+            try:
+                segment_width = draw.textlength(segment_text, font=font)
+            except:
+                # Final fallback - estimate based on character count
+                segment_width = len(segment_text) * (font_size // 2)
+
+        x += segment_width
+
+    final_x = x
+    return final_x
+
+def generate_text_image(text, font_size=30):
+    """Generate a PIL image with centered text on white background with text wrapping."""
+    if display is None:
+        logger.error("Display not initialized")
+        return None
+
+    try:
+        # Create a white background image for e-ink display
+        image = Image.new("RGB", (display.width, display.height), (255, 255, 255))
+        draw = ImageDraw.Draw(image)
+
+        # Try to load a font, fallback to default if not available
+        try:
+            font = ImageFont.truetype(FONT, font_size)
+        except:
+            try:
+                logger.warning(f'ERROR TO LOAD INTER FONT WITH SIZE {font_size}!')
+                font = ImageFont.load_default()
+            except:
+                logger.error('ERROR TO LOAD DEFAULT FONT!')
+                font = ImageFont.load_default()
+
+        # Generate wrapped colored text lines
+        max_text_width = display.width - 40  # 20px padding on each side
+        wrapped_lines = generate_wrapped_colored_text(text, font, max_text_width)
+
+        logger.debug(f"DEBUG WRAPPED LINES: {wrapped_lines}")
+
+        # Calculate uniform line height based on font metrics
+        try:
+            # Get a sample text to determine consistent line height
+            sample_bbox = font.getbbox("Ay")
+            uniform_line_height = sample_bbox[3] - sample_bbox[1]
+        except:
+            # Fallback for older PIL versions
+            _, uniform_line_height = draw.textsize("Ay", font=font)
+            uniform_line_height = int(uniform_line_height)
+
+        # Calculate line widths (use uniform height)
+        line_widths = []
+
+        for line_parts in wrapped_lines:
+            line_width = 0
+
+            for part_text, color in line_parts:
+                # Calculate text width using mixed fonts
+                part_width, _ = get_mixed_text_size(part_text, font_size)
+                line_width += part_width
+
+            line_widths.append(line_width)
+
+        # Calculate total height with line spacing and safety margin
+        line_spacing = int(font_size * 0.2)  # 20% of font size
+        total_height = uniform_line_height * len(wrapped_lines)
+        if len(wrapped_lines) > 1:
+            total_height += line_spacing * (len(wrapped_lines) - 1)
+
+        # Add small safety margin to prevent text from going off-screen
+        total_height = int(total_height * 1.05)
+
+        # Find the maximum line width for centering
+        max_line_width = max(line_widths) if line_widths else 0
+
+        # Center the text block with margin to ensure it fits on screen
+        start_y = max(10, (display.height - total_height) // 2)
+
+        # Draw each line with uniform height
+        current_y = start_y
+        for i, (line_parts, line_width) in enumerate(zip(wrapped_lines, line_widths)):
+            # Center this line horizontally
+            start_x = (display.width - line_width) // 2
+
+            logger.debug(f"DEBUG LINE {i}: start_y={current_y}, line_width={line_width}, start_x={start_x}, uniform_line_height={uniform_line_height}")
+
+            # Draw each part in the line using mixed fonts
+            current_x = start_x
+            for j, (part_text, color) in enumerate(line_parts):
+                if color == 'RED':
+                    text_color = (255, 0, 0)
+                else:
+                    text_color = (0, 0, 0)
+
+                # Calculate text dimensions using mixed fonts
+                part_width, part_height = get_mixed_text_size(part_text, font_size)
+
+                # Simple approach: position all parts at the same Y coordinate for the line
+                # This ensures proper alignment across different character heights
+                part_y = current_y
+
+                logger.debug(f"  PART {j}: '{part_text}' color={color} x={current_x}, y={part_y}, width={part_width}, height={part_height}")
+
+                # Draw text using mixed fonts (Inter + Noto Color Emoji)
+                draw_mixed_text(draw, (current_x, part_y), part_text, font_size, text_color)
+
+                # Move to next part position
+                current_x += part_width
+
+            # Move to next line using uniform height
+            current_y += uniform_line_height
+            if i < len(wrapped_lines) - 1:  # Add spacing except for last line
+                current_y += line_spacing
+
+        return image
+
+    except Exception as e:
+        logger.error(f"Failed to generate text image: {e}")
+        return None
+
+def display_text(text, font_size=30):
+    """Display text on the e-ink display."""
+    global display
+    if display is None:
+        logger.error("Display not initialized")
+        return False
+
+    try:
+        # Generate the text image
+        image = generate_text_image(text, font_size)
+        if image is None:
+            return False
+
+        # Clear the display first to ensure a clean white background
+        display.fill(Adafruit_EPD.WHITE)
+
+        # Display the image
+        display.image(image)
+        display.display()
+
+        logger.info(f"Text displayed successfully: '{text}' with font size {font_size}")
+        return True
+
+    except Exception as e:
+        logger.error(f"Failed to display text: {e}")
+        return False
+
+def generate_clock_image():
+    """Generate a PIL image with current time display."""
+    if display is None:
+        logger.error("Display not initialized")
+        return None
+
+    try:
+        # Get current time
+        now = datetime.now()
+        time_str = now.strftime("%H:%M")
+        date_str = now.strftime("%d.%m.%Y")
+
+        # Create a white background image for e-ink display
+        image = Image.new("RGB", (display.width, display.height), (255, 255, 255))
+        draw = ImageDraw.Draw(image)
+
+        # Calculate font sizes based on display dimensions
+        time_font_size = min(display.width // 4, display.height // 3, 120)
+        date_font_size = time_font_size // 3
+
+        # Try to load fonts, fallback to default if not available
+        try:
+            time_font = ImageFont.truetype(FONT, time_font_size)
+            date_font = ImageFont.truetype(FONT, date_font_size)
+        except:
+            try:
+                time_font = ImageFont.load_default()
+                date_font = ImageFont.load_default()
+            except:
+                logger.error('ERROR TO LOAD DEFAULT FONT!')
+                return None
+
+        # Calculate text dimensions for centering
+        try:
+            time_bbox = time_font.getbbox(time_str)
+            time_width = time_bbox[2] - time_bbox[0]
+            time_height = time_bbox[3] - time_bbox[1]
+
+            date_bbox = date_font.getbbox(date_str)
+            date_width = date_bbox[2] - date_bbox[0]
+            date_height = date_bbox[3] - date_bbox[1]
+        except:
+            # Fallback for older PIL versions
+            time_width, time_height = draw.textsize(time_str, font=time_font)
+            date_width, date_height = draw.textsize(date_str, font=date_font)
+
+        # Calculate positions
+        time_x = (display.width - time_width) // 2
+        time_y = (display.height - time_height - date_height - 20) // 2
+
+        date_x = (display.width - date_width) // 2
+        date_y = time_y + time_height + 60
+
+        # Draw time
+        draw.text((time_x, time_y), time_str, font=time_font, fill=(0, 0, 0))
+
+        # Draw date
+        draw.text((date_x, date_y), date_str, font=date_font, fill=(0, 0, 0))
+
+        return image
+
+    except Exception as e:
+        logger.error(f"Failed to generate clock image: {e}")
+        return None
+
+def display_clock():
+    """Display current time on the e-ink display."""
+    global display
+    if display is None:
+        logger.error("Display not initialized")
+        return False
+
+    try:
+        # Generate the clock image
+        image = generate_clock_image()
+        if image is None:
+            return False
+
+        # Clear the display first to ensure a clean white background
+        display.fill(Adafruit_EPD.WHITE)
+
+        # Display the image
+        display.image(image)
+        display.display()
+
+        logger.info(f"Clock displayed successfully: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        return True
+
+    except Exception as e:
+        logger.error(f"Failed to display clock: {e}")
+        return False
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send a message when the command /start is issued."""
+    user = update.effective_user
+    await update.message.reply_html(
+        f"Hi {user.mention_html()}! Send me an image and I'll display it on the e-ink screen.",
+    )
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send a message when the command /help is issued."""
+    await update.message.reply_text(
+        "Send me an image (photo or document) and I'll display it on the e-ink screen.\n"
+        "Commands:\n"
+        "/start - Start the bot\n"
+        "/help - Show this help message\n"
+        "/clear - Clear the display\n"
+        "/text <message> [font_size] - Display text on the screen (optional font size, auto if not specified)\n"
+        "/clock - Display a continuously updating clock (updates every minute)\n"
+        "/debug - Toggle debug mode (send displayed images back to you)\n\n"
+        "Text Features:\n"
+        "• Auto text wrapping - Long messages automatically wrap to multiple lines\n"
+        "• Auto font sizing - Automatically finds optimal font size to fit text\n"
+        "• Use RED{text} to make text appear in red color\n"
+        "• Multiple RED{...} sections supported in wrapped text\n"
+        "• Font size range: 1-200 pixels (when specified manually)\n\n"
+        "Clock Features:\n"
+        "• Shows current time in HH:MM:SS format\n"
+        "• Displays current date below the time\n"
+        "• Updates automatically every minute\n"
+        "• Large, easy-to-read font size\n"
+        "• Use /clock again to stop the clock\n\n"
+        "Examples:\n"
+        "/text Hello World - Auto-size 'Hello World' to fit screen\n"
+        "/text This is a very long message that will wrap - Auto-wraps long text\n"
+        "/text Hello World 48 - Display 'Hello World' with font size 48\n"
+        "/text Hello RED{World} from RED{Bot} - Multi-color text with wrapping\n"
+        "/text RED{Error:} Something went wrong - Auto-wrapped error message\n"
+        "/clock - Start a continuously updating clock display"
+    )
+
+async def clear_display(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Clear the e-ink display."""
+    global display
+
+    # Stop clock if it's running
+    stop_clock()
+
+    if display is None:
+        await update.message.reply_text("Display not initialized.")
+        return
+
+    try:
+        display.fill(Adafruit_EPD.WHITE)
+        display.display()
+        await update.message.reply_text("Display cleared!")
+        logger.info("Display cleared")
+    except Exception as e:
+        await update.message.reply_text(f"Failed to clear display: {e}")
+        logger.error(f"Failed to clear display: {e}")
+
+async def text_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle the /text command to display text on the e-ink screen."""
+    # Stop clock if it's running
+    stop_clock()
+
+    # Check if text was provided
+    if not context.args:
+        await update.message.reply_text("Please provide text to display. Usage: /text <your message> [font_size]")
+        return
+
+    # Parse font size from arguments (check if last argument is a number)
+    font_size = None  # Will be auto-calculated if not provided
+    text_args = context.args
+    auto_sized = False
+
+    try:
+        # Try to parse the last argument as font size
+        potential_font_size = int(context.args[-1])
+        if potential_font_size > 0 and potential_font_size <= 200:  # reasonable font size range
+            font_size = potential_font_size
+            text_args = context.args[:-1]  # Remove font size from text
+    except (ValueError, IndexError):
+        # Last argument is not a number, use auto font sizing
+        auto_sized = True
+
+    # Join remaining arguments to form the complete message
+    text_message = " ".join(text_args)
+
+    # Auto-calculate font size if not provided
+    if auto_sized or font_size is None:
+        try:
+            # Remove RED{...} tags for accurate text measurement
+            clean_text = text_message.replace("RED{", "").replace("}", "")
+            logger.debug(f'RECEIVED TEXT: "{clean_text}"')
+            font_size = find_font_size(clean_text, display.width - 40, display.height - 40, FONT)
+            auto_sized = True
+            logger.info(f"Auto-calculated font size: {font_size} for text: '{text_message}'")
+        except Exception as e:
+            logger.error(f"Failed to auto-calculate font size: {e}")
+            font_size = 30  # fallback to default
+            auto_sized = False
+
+    # Display the text
+    if display_text(text_message, font_size):
+        if auto_sized:
+            font_info = f" (auto font size: {font_size})"
+        elif font_size != 30:
+            font_info = f" (font size: {font_size})"
+        else:
+            font_info = ""
+
+        await update.message.reply_text(f"Text displayed on e-ink screen: '{text_message}'{font_info}")
+
+        if debug_mode:
+            # Send the rendered text image back to user in debug mode
+            try:
+                # Generate the text image using the new function
+                image = generate_text_image(text_message, font_size)
+                if image is not None:
+                    # Convert to bytes for sending
+                    img_byte_arr = BytesIO()
+                    image.save(img_byte_arr, format='PNG')
+                    img_byte_arr.seek(0)
+                    await update.message.reply_photo(photo=img_byte_arr)
+                else:
+                    logger.error("Failed to generate text image for debug mode")
+            except Exception as e:
+                logger.error(f"Failed to send debug text image: {e}")
+    else:
+        await update.message.reply_text("Failed to display text. Please try again.")
+
+async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Toggle debug mode on/off."""
+    global debug_mode
+    debug_mode = not debug_mode
+
+    if debug_mode:
+        await update.message.reply_text("Debug mode ON - I'll send you copies of what I display on the screen.")
+    else:
+        await update.message.reply_text("Debug mode OFF - I won't send images back.")
+
+async def clock_update_loop():
+    """Background task that updates the clock display every minute."""
+    global clock_active
+
+    while clock_active:
+        try:
+            # Display current time
+            if display_clock():
+                logger.debug("Clock updated successfully")
+            else:
+                logger.error("Failed to update clock display")
+
+            # Wait until the next minute (sync with minute boundary)
+            now = datetime.now()
+            next_minute = (now + timedelta(minutes=1)).replace(second=0, microsecond=0)
+            sleep_seconds = (next_minute - now).total_seconds()
+
+            logger.debug(f"Clock will update in {sleep_seconds:.1f} seconds")
+            await asyncio.sleep(sleep_seconds)
+
+        except Exception as e:
+            logger.error(f"Error in clock update loop: {e}")
+            # Sleep for 1 minute on error before retrying
+            await asyncio.sleep(60)
+
+async def clock_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle the /clock command to display a continuously updating clock."""
+    global clock_active, clock_task
+
+    try:
+        if clock_active:
+            # Stop the clock
+            clock_active = False
+            if clock_task:
+                clock_task.cancel()
+                clock_task = None
+
+            await update.message.reply_text("Clock stopped! Send another command to display something new.")
+            logger.info("Clock stopped by user command")
+        else:
+            # Start the clock
+            clock_active = True
+
+            # Display clock immediately
+            if display_clock():
+                await update.message.reply_text("Clock started! Displaying current time. The clock will update every minute.\nSend /clock again to stop it.")
+
+                # Start the background update loop
+                clock_task = asyncio.create_task(clock_update_loop())
+                logger.info("Clock started by user command")
+            else:
+                clock_active = False
+                await update.message.reply_text("Failed to start clock display. Please try again.")
+                logger.error("Failed to start clock display")
+
+    except Exception as e:
+        await update.message.reply_text(f"Error with clock command: {e}")
+        logger.error(f"Clock command error: {e}")
+
+def stop_clock():
+    """Stop the clock display if it's active."""
+    global clock_active, clock_task
+
+    if clock_active:
+        clock_active = False
+        if clock_task:
+            clock_task.cancel()
+            clock_task = None
+        logger.info("Clock stopped")
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle photo messages."""
+    # Stop clock if it's running
+    stop_clock()
+
+    await update.message.reply_text("Processing photo...")
+
+    # Get the largest photo size
+    photo = update.message.photo[-1]
+
+    try:
+        # Download the photo
+        file = await context.bot.get_file(photo.file_id)
+        photo_bytes = await file.download_as_bytearray()
+
+        # Display the image
+        if process_and_display_image(photo_bytes):
+            await update.message.reply_text("Photo displayed on e-ink screen!")
+            if debug_mode:
+                # Send the processed image back to user in debug mode
+                try:
+                    # Recreate the final image for sending
+                    image = Image.open(BytesIO(photo_bytes))
+
+                    # Convert to RGB if necessary
+                    if image.mode != 'RGB':
+                        image = image.convert('RGB')
+
+                    # Scale the image to the smaller screen dimension
+                    image_ratio = image.width / image.height
+                    screen_ratio = display.width / display.height
+                    if screen_ratio < image_ratio:
+                        scaled_width = image.width * display.height // image.height
+                        scaled_height = display.height
+                    else:
+                        scaled_width = display.width
+                        scaled_height = image.height * display.width // image.width
+                    image = image.resize((scaled_width, scaled_height), Image.BICUBIC)
+
+                    # Crop and center the image
+                    x = scaled_width // 2 - display.width // 2
+                    y = scaled_height // 2 - display.height // 2
+                    image = image.crop((x, y, x + display.width, y + display.height)).convert("RGB")
+
+                    # Create palette for tri-color display
+                    palette = []
+                    for i in range(256):
+                        if i < 64:
+                            palette.extend([0, 0, 0])  # Black
+                        elif i < 127:
+                            palette.extend([255, 0, 0])  # Red
+                        else:
+                            palette.extend([255, 255, 255])  # White
+
+                    # Create a palette image
+                    palette_img = Image.new("P", (1, 1))
+                    palette_img.putpalette(palette)
+
+                    # Quantize the image using Floyd-Steinberg dithering
+                    image = image.quantize(palette=palette_img, dither=Image.FLOYDSTEINBERG)
+                    image = image.convert("RGB")
+
+                    # Convert to bytes for sending
+                    img_byte_arr = BytesIO()
+                    image.save(img_byte_arr, format='PNG')
+                    img_byte_arr.seek(0)
+
+                    await update.message.reply_photo(photo=img_byte_arr)
+                except Exception as e:
+                    logger.error(f"Failed to send debug image: {e}")
+        else:
+            await update.message.reply_text("Failed to display photo. Please try again.")
+
+    except Exception as e:
+        await update.message.reply_text(f"Failed to process photo: {e}")
+        logger.error(f"Failed to process photo: {e}")
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle document messages (images sent as documents)."""
+    # Stop clock if it's running
+    stop_clock()
+
+    # Check if document is an image
+    if not update.message.document.mime_type.startswith('image/'):
+        await update.message.reply_text("Please send an image file.")
+        return
+
+    await update.message.reply_text("Processing image document...")
+
+    try:
+        # Download the document
+        file = await context.bot.get_file(update.message.document.file_id)
+        file_bytes = await file.download_as_bytearray()
+
+        # Display the image
+        if process_and_display_image(file_bytes):
+            await update.message.reply_text("Image displayed on e-ink screen!")
+            if debug_mode:
+                # Send the processed image back to user in debug mode
+                try:
+                    # Recreate the final image for sending
+                    image = Image.open(BytesIO(file_bytes))
+
+                    # Convert to RGB if necessary
+                    if image.mode != 'RGB':
+                        image = image.convert('RGB')
+
+                    # Scale the image to the smaller screen dimension
+                    image_ratio = image.width / image.height
+                    screen_ratio = display.width / display.height
+                    if screen_ratio < image_ratio:
+                        scaled_width = image.width * display.height // image.height
+                        scaled_height = display.height
+                    else:
+                        scaled_width = display.width
+                        scaled_height = image.height * display.width // image.width
+                    image = image.resize((scaled_width, scaled_height), Image.BICUBIC)
+
+                    # Crop and center the image
+                    x = scaled_width // 2 - display.width // 2
+                    y = scaled_height // 2 - display.height // 2
+                    image = image.crop((x, y, x + display.width, y + display.height)).convert("RGB")
+
+                    # Create palette for tri-color display
+                    palette = []
+                    for i in range(256):
+                        if i < 64:
+                            palette.extend([0, 0, 0])  # Black
+                        elif i < 127:
+                            palette.extend([255, 0, 0])  # Red
+                        else:
+                            palette.extend([255, 255, 255])  # White
+
+                    # Create a palette image
+                    palette_img = Image.new("P", (1, 1))
+                    palette_img.putpalette(palette)
+
+                    # Quantize the image using Floyd-Steinberg dithering
+                    image = image.quantize(palette=palette_img, dither=Image.FLOYDSTEINBERG)
+                    image = image.convert("RGB")
+
+                    # Convert to bytes for sending
+                    img_byte_arr = BytesIO()
+                    image.save(img_byte_arr, format='PNG')
+                    img_byte_arr.seek(0)
+
+                    await update.message.reply_photo(photo=img_byte_arr)
+                except Exception as e:
+                    logger.error(f"Failed to send debug image: {e}")
+        else:
+            await update.message.reply_text("Failed to display image. Please try again.")
+
+    except Exception as e:
+        await update.message.reply_text(f"Failed to process image: {e}")
+        logger.error(f"Failed to process image: {e}")
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log Errors caused by Updates."""
+    logger.warning('Update "%s" caused error "%s"', update, context.error)
+
+def main():
+    """Start the bot."""
+    # Get Telegram bot token from environment variable
+    token = os.getenv('TELEGRAM_BOT_TOKEN')
+    if not token:
+        logger.error("TELEGRAM_BOT_TOKEN not found in environment variables!")
+        logger.error("Please create a .env file with your Telegram bot token:")
+        logger.error("TELEGRAM_BOT_TOKEN=your_bot_token_here")
+        return
+
+    # Initialize the display
+    if not init_display():
+        logger.error("Failed to initialize display. Bot will start but display functions won't work.")
+
+    # Create the Application
+    application = Application.builder().token(token).build()
+
+    # Add handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("clear", clear_display))
+    application.add_handler(CommandHandler("text", text_command))
+    application.add_handler(CommandHandler("clock", clock_command))
+    application.add_handler(CommandHandler("debug", debug_command))
+    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    application.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
+
+    # Add error handler
+    application.add_error_handler(error_handler)
+
+    # Start the Bot
+    logger.info("Starting Telegram bot...")
+    application.run_polling()
+
+if __name__ == '__main__':
+    main()
